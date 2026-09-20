@@ -17,18 +17,32 @@
  *
  * 开机自动播放 config.h 的 MUSIC_START_FILE 指定的乐谱（软件混音多和弦 ->
  * I2S 功放）；src/music/ 下的所有乐谱都会编入固件（见 score_playlist.h）。
- *   KEY1 短按：播放/暂停/继续；KEY1 长按 2s：从当前曲目开头重播
+ *   KEY1 短按：播放 / 暂停 / 继续
  *   KEY2 短按：音量（五级循环）
  *   KEY3 短按：切换下一曲
+ *   KEY4 短按：从当前曲目开头重播（原 KEY1"长按 2s 重播"已移除）
  *   BOOT 短按：切换音色（正弦/三角/方波/锯齿，立即生效不打断播放）
+ *   一曲播完后自动接下一曲并循环回第 1 首（间隔见 config.h 的
+ *   MUSIC_AUTO_NEXT_MS；期间任意播放相关按键都会取消这次自动切换）
  *
  * 关键设计：OLED 渲染（软件 I2C 每帧约 300ms）放到独立任务 uiTask
  * 在 core 1 上跑；loop 只负责按键扫描与状态同步，按键响应不再被
  * 渲染阻塞（此前按键"按几次才反应"即因渲染卡住主循环所致）。
  * ============================================================ */
 
-/* U8g2：SSD1306 128x64，软件 I2C 直连 GPIO */
-U8G2_SSD1306_128X64_NONAME_F_SW_I2C u8g2(U8G2_R0, OLED_SCL_PIN, OLED_SDA_PIN);
+/* U8g2：SSD1306 128x64，硬件 I2C（ESP32 的 I2C 外设可映射到任意 GPIO，
+ * 所以引脚不用动）。软件 I2C 靠位翻转 + delayMicroseconds，每帧 ~74ms，
+ * 刷屏/滚动时会出现自上而下的"扫描感"；换成硬件 I2C 后每帧 ~23ms。
+ * 速率由 config.h 的 OLED_I2C_HZ 决定（默认 400kHz）。 */
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset=*/ U8X8_PIN_NONE,
+                                         /* clock=*/ OLED_SCL_PIN,
+                                         /* data =*/ OLED_SDA_PIN);
+
+/* 兜底：万一换硬件 I2C 后屏幕不亮/花屏（极少数模块没焊 I2C 上拉电阻 ——
+ * 软件 I2C 是推挽驱动、不依赖上拉，硬件 I2C 是开漏、必须有上拉），
+ * 先把 config.h 的 OLED_I2C_HZ 降到 100000；仍不行就把上面两行注释掉，
+ * 换成下面这行的软件 I2C 版本（引脚相同，其它代码都不用动）。
+ * U8G2_SSD1306_128X64_NONAME_F_SW_I2C u8g2(U8G2_R0, OLED_SCL_PIN, OLED_SDA_PIN); */
 
 /* 标题窗口与边距。
  * UI_MARGIN_X：左右留 4px 边距，曲名不再紧贴屏幕左边缘 —— 0.96" OLED 模块
@@ -44,6 +58,12 @@ U8G2_SSD1306_128X64_NONAME_F_SW_I2C u8g2(U8G2_R0, OLED_SCL_PIN, OLED_SDA_PIN);
 #define UI_TITLE_Y      3
 #define UI_TITLE_H      18u
 #define UI_PROG_Y       22u
+
+/* 局部刷新用：标题条覆盖的 tile 数（1 tile = 8 像素高）。
+ * 曲名字形实测只落在 y=2..13，取 3 个 tile（0..23 行）留足余量；
+ * 局部刷新数据量 = 16 × 3 × 8 = 384 字节，整帧则是 1024 字节。 */
+#define UI_TITLE_TX     16u                   /* tile 宽（128/8） */
+#define UI_TITLE_TY     3u                    /* tile 高（覆盖 0..23 行） */
 
 /* 当前曲目索引（loop 写，uiTask 读） */
 static volatile uint8_t s_song = 0u;
@@ -102,6 +122,19 @@ static volatile uint8_t  s_popup       = 0u;
 static volatile uint32_t s_popup_until = 0u;
 static volatile uint8_t  s_dirty     = 1u;  /* 需要立即重绘 */
 
+/* 切到下一曲并从头播放；最后一首之后回到第 0 首（循环）。
+ * KEY3 短按与"播完自动切曲"都走这里。 */
+static void Song_Next(void)
+{
+    uint8_t next = (uint8_t)(s_song + 1u);
+    if (next >= SCORE_COUNT) next = 0u;
+    s_song = next;
+    Music_Play(g_playlist[next]);
+    s_dirty = 1u;
+    Serial.printf("[song] next #%u/%u \"%s\"\n",
+                  (unsigned)next + 1u, (unsigned)SCORE_COUNT, g_playlist_names[next]);
+}
+
 /* ---- UI 渲染任务（core 1）：滚动 + 绘制 ---- */
 static void uiTask(void *arg)
 {
@@ -122,9 +155,10 @@ static void uiTask(void *arg)
         /* 状态行临时提示（音量/音色，2s 内有效），过期后回到时间+播放状态 */
         uint8_t popup = (s_popup_until && now < s_popup_until) ? s_popup : 0u;
         uint8_t need = 0u;
+        uint8_t full = 0u;              /* 1=整屏刷新，0=只刷标题条那几个 tile */
         uint8_t song = s_song;
 
-        /* 换曲：重新取曲名、重算滚动参数（新曲名长度不同），立即重绘 */
+        /* 换曲：重新取曲名、重算滚动参数（新曲名长度不同），立即整屏重绘 */
         if (song != last_song)
         {
             last_song = song;
@@ -133,17 +167,19 @@ static void uiTask(void *arg)
             t_title = now;
             t_pause = now;
             need = 1u;
+            full = 1u;
         }
 
-        /* 标题过长时自动滚动：每 30ms 步进 2px(共 pix_max 像素)，
+        /* 标题过长时自动滚动：每 25ms 步进 1px（约 36 px/s）。
+         * 以前是 2px/30ms：局部刷新只要 ~9ms，改成 1px 一样快但更细腻、不"跳"。
          * 开头/末尾各停顿 2s（phase 2=开头停顿 0=滚动 1=末尾停顿） */
-        if (scrolling && now - t_title >= 30u)
+        if (scrolling && now - t_title >= 25u)
         {
             t_title = now;
             switch (phase)
             {
             case 0u:
-                pix += 2u;
+                pix += 1u;
                 if (pix >= (uint16_t)pix_max)
                 {
                     pix = (uint16_t)pix_max;
@@ -167,8 +203,13 @@ static void uiTask(void *arg)
             }
         }
 
-        /* 渲染时机：需要立即重绘 / 音量提示切换 / 每 1s 进度刷新 */
-        if (!(s_dirty || popup != last_popup || now - t_render >= 1000u || need))
+        /* 刷新范围：
+         *   状态行变了（换曲 / 音量音色提示切换 / 每秒进度）→ 整屏
+         *   只有标题在滚动一格                                  → 只刷标题条
+         * 局部刷新把每次的数据量从 1024B 降到 384B，滚动时不会整屏重画，
+         * "扫描感"就是这么来的。 */
+        if (s_dirty || popup != last_popup || now - t_render >= 1000u) full = 1u;
+        if (!(full || need))
             continue;
 
         /* 组装状态文本（UTF-8） */
@@ -178,31 +219,36 @@ static void uiTask(void *arg)
         else if (s_state == 0u) { st = TX_PLAY; }
         else                     { st = TX_PAUSE; }
 
-        u8g2.firstPage();
-        do
-        {
-            /* 第 1 行：曲名，窗口裁剪 + 像素偏移滚动（中文 -> drawUTF8） */
-            u8g2.setFont(u8g2_font_wqy12_t_gb2312_self);
-            u8g2.setFontPosTop();
-            u8g2.setClipWindow(UI_TITLE_X0, 0, UI_TITLE_X1, UI_TITLE_H);
-            u8g2.drawUTF8(UI_TITLE_X0 - (int16_t)pix, UI_TITLE_Y, title);
-            u8g2.setMaxClipWindow();
+        /* 先在内存里画好整帧（全缓冲模式），再决定推多少给屏幕 */
+        u8g2.clearBuffer();
 
-            /* 第 2 行：中文进度/音量（UTF-8 字符串 + drawUTF8） */
-            u8g2.setFont(u8g2_font_wqy12_t_gb2312_self);
-            u8g2.setFontPosTop();
-            char buf[40];
-            if (popup == 2u)          /* BOOT 切音色后的提示 */
-                snprintf(buf, sizeof(buf), "%s %s", TX_TIMBRE,
-                         WAVE_NAME[(s_wave < WAVE_COUNT) ? s_wave : 0u]);
-            else if (popup == 1u)     /* KEY2 调音量后的提示 */
-                snprintf(buf, sizeof(buf), "%s %u/5", TX_VOL, (unsigned)s_vol);
-            else
-                snprintf(buf, sizeof(buf), "%s %02u:%02u %s", TX_TIME,
-                         (unsigned)(ms / 60000u),
-                         (unsigned)((ms % 60000u) / 1000u), st);
-            u8g2.drawUTF8(UI_MARGIN_X, UI_PROG_Y, buf);
-        } while (u8g2.nextPage());
+        /* 第 1 行：曲名，窗口裁剪 + 像素偏移滚动（中文 -> drawUTF8） */
+        u8g2.setFont(u8g2_font_wqy12_t_gb2312_self);
+        u8g2.setFontPosTop();
+        u8g2.setClipWindow(UI_TITLE_X0, 0, UI_TITLE_X1, UI_TITLE_H);
+        u8g2.drawUTF8(UI_TITLE_X0 - (int16_t)pix, UI_TITLE_Y, title);
+        u8g2.setMaxClipWindow();
+
+        /* 第 2 行：中文进度/音量（UTF-8 字符串 + drawUTF8） */
+        u8g2.setFont(u8g2_font_wqy12_t_gb2312_self);
+        u8g2.setFontPosTop();
+        char buf[40];
+        if (popup == 2u)          /* BOOT 切音色后的提示 */
+            snprintf(buf, sizeof(buf), "%s %s", TX_TIMBRE,
+                     WAVE_NAME[(s_wave < WAVE_COUNT) ? s_wave : 0u]);
+        else if (popup == 1u)     /* KEY2 调音量后的提示 */
+            snprintf(buf, sizeof(buf), "%s %u/5", TX_VOL, (unsigned)s_vol);
+        else
+            snprintf(buf, sizeof(buf), "%s %02u:%02u %s", TX_TIME,
+                     (unsigned)(ms / 60000u),
+                     (unsigned)((ms % 60000u) / 1000u), st);
+        u8g2.drawUTF8(UI_MARGIN_X, UI_PROG_Y, buf);
+
+        /* 推送：整屏 1024B，或只推标题条 384B（滚动时用） */
+        if (full)
+            u8g2.sendBuffer();
+        else
+            u8g2.updateDisplayArea(0, 0, UI_TITLE_TX, UI_TITLE_TY);
 
         s_dirty = 0u;
         last_popup = popup;
@@ -215,10 +261,11 @@ void setup()
     Serial.begin(115200);
     Serial.println("[Boot] start");
 
+    u8g2.setBusClock(OLED_I2C_HZ);    /* 硬件 I2C 速率，见 config.h */
     u8g2.begin();
     u8g2.clear();
     u8g2.sendBuffer();
-    Serial.println("[Boot] OLED ok");
+    Serial.printf("[Boot] OLED ok (%lu Hz I2C)\n", (unsigned long)OLED_I2C_HZ);
 
     Key_Init();
     Serial.println("[Boot] Key ok");
@@ -242,7 +289,21 @@ void setup()
 
 void loop()
 {
-    static uint32_t t_heart = 0u;
+    static uint32_t t_heart     = 0u;
+    static uint8_t  last_fin    = 0u;   /* 上一次读到的"播完"标志，用于检测上升沿 */
+    static uint8_t  auto_next   = 0u;   /* 已安排"播完自动切下一曲" */
+    static uint32_t auto_at     = 0u;   /* 自动切曲的时刻（millis） */
+
+    /* ---- 播完自动接下一曲 ----
+     * Music_IsFinished() 播完后会一直保持 1（直到 Music_Play 才清零），
+     * 所以这里只认"0 -> 1"的上升沿，避免每轮循环重复切曲。 */
+    uint8_t fin = Music_IsFinished();
+    if (fin && !last_fin)
+    {
+        auto_next = 1u;
+        auto_at   = millis() + (uint32_t)MUSIC_AUTO_NEXT_MS;   /* 留出间隔显示"完成" */
+    }
+    last_fin = fin;
 
     /* 心跳：每 2s 一次，确认 loop（按键扫描）仍在运行 */
     if (millis() - t_heart >= 2000u)
@@ -257,20 +318,23 @@ void loop()
 
     uint8_t key = Key_GetNum();
 
-    /* KEY1 短按：播放 / 暂停 / 播完后重播 */
+    /* KEY1 短按：播放 / 暂停 / 继续（播完后按 = 重播本曲） */
     if (key == KEY1_SHORT)
     {
+        auto_next = 0u;                 /* 手动操作优先，取消自动切曲 */
         if (Music_IsPlaying())        Music_Pause();
         else if (Music_IsFinished())  Music_Play(g_playlist[s_song]);
         else                          Music_Resume();
         s_dirty = 1u;
     }
-    /* KEY1 长按 2s：当前曲目从头重播（播放中/暂停/已结束都适用） */
-    else if (key == KEY1_LONG)
+    /* KEY4 短按：从当前曲目开头重播（播放中 / 暂停 / 已结束都适用）。
+     * 原先挂在 KEY1 的长按上，现改为独立按键、按下即响应。 */
+    else if (key == KEY4_SHORT)
     {
+        auto_next = 0u;                 /* 取消已安排的自动切曲 */
         Music_Play(g_playlist[s_song]);
         s_dirty = 1u;
-        Serial.printf("[key] restart #%u \"%s\"\n",
+        Serial.printf("[key] replay #%u \"%s\"\n",
                       (unsigned)s_song, g_playlist_names[s_song]);
     }
     /* KEY2 短按：音量五级循环（0 静音 -> 4 最大），短暂显示音量 */
@@ -287,13 +351,8 @@ void loop()
     /* KEY3 短按：切下一曲（放到最后一首后再按回到第 0 首） */
     else if (key == KEY3_SHORT)
     {
-        uint8_t next = (uint8_t)(s_song + 1u);
-        if (next >= SCORE_COUNT) next = 0u;
-        s_song = next;
-        Music_Play(g_playlist[next]);
-        s_dirty = 1u;
-        Serial.printf("[key] next #%u/%u \"%s\"\n",
-                      (unsigned)next, (unsigned)SCORE_COUNT, g_playlist_names[next]);
+        auto_next = 0u;                 /* 手动切歌，取消已安排的自动切换 */
+        Song_Next();
     }
     /* BOOT 键短按：循环切换音色（正弦 -> 三角 -> 方波 -> 锯齿），
      * 已在发声的音符立即换波形，不打断播放/进度 */
@@ -306,6 +365,13 @@ void loop()
         s_popup_until = millis() + 2000u;
         s_dirty = 1u;
         Serial.printf("[key] timbre -> %u\n", (unsigned)w);
+    }
+
+    /* 到达自动切曲时刻：切下一曲（最后一首之后回到第 1 首，循环播放） */
+    if (auto_next && (int32_t)(millis() - auto_at) >= 0)
+    {
+        auto_next = 0u;
+        Song_Next();
     }
 
     /* 同步共享进度状态给 uiTask */

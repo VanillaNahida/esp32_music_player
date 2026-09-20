@@ -8,3 +8,4 @@
 .vscode/*
 .trae/
 compile_commands.json
+src/score_playlist.h

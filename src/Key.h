@@ -4,15 +4,14 @@
 #include <stdint.h>
 
 /* 按键事件码：Key_GetNum() 的返回值，0 = 本轮无事件。
- * 短按 = 消抖后按下并松手；长按 = 持续按住 >= KEY_LONG_MS（config.h）。 */
+ * 所有按键行为统一：消抖确认"按下"时上报一次（KEYx_SHORT），按住不放不连发，
+ * 松手不产生事件。不检测长按（原 KEY1"长按 2s 重播"已改为 KEY4 短按）。 */
 #define KEY_NONE        0u
-#define KEY1_SHORT      1u
-#define KEY2_SHORT      2u
-#define KEY3_SHORT      3u
-#define KEY_BOOT_SHORT  4u      /* 板载 BOOT 键（GPIO0）：切换音色 */
-#define KEY1_LONG       11u
-#define KEY2_LONG       12u
-#define KEY3_LONG       13u
+#define KEY1_SHORT      1u      /* 播放 / 暂停 / 继续 */
+#define KEY2_SHORT      2u      /* 音量五级循环 */
+#define KEY3_SHORT      3u      /* 切换下一曲 */
+#define KEY4_SHORT      4u      /* 从当前曲目开头重播 */
+#define KEY_BOOT_SHORT  5u      /* 板载 BOOT 键（GPIO0）：切换音色 */
 
 void Key_Init(void);
 

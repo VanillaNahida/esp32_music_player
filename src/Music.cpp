@@ -112,8 +112,12 @@ static int32_t PeakGain(uint8_t velocity, uint8_t track)
 /* 启动一个音符（在渲染块内调用） */
 static void NoteOn(const ScoreNote *n)
 {
-    if (n->track >= TRACK_NUM) return;
-    if (!g_track_en[n->track]) return;
+    /* 轨道号超出配置数组范围时不再直接丢弃，而是钳到最后一档。
+     * （track 是 MIDI 轨道下标 0~15，标准 MIDI 的声音常在 1、2、3… 轨；
+     *   以前 MUSIC_TRACK_ENABLE 只写 2 项，track>=2 的音符会被整段丢掉。） */
+    uint8_t tr = n->track;
+    if (tr >= TRACK_NUM) tr = (uint8_t)(TRACK_NUM - 1u);
+    if (!g_track_en[tr]) return;
 
     Voice *v = 0;
     uint32_t oldest = 0xFFFFFFFFu;
@@ -131,7 +135,7 @@ static void NoteOn(const ScoreNote *n)
     v->env          = ENV_ATTACK;
     v->phase        = 0u;
     v->phase_inc    = g_phase_inc[n->midi];
-    v->peak         = PeakGain(n->velocity, n->track);
+    v->peak         = PeakGain(n->velocity, tr);   /* 用钳好的轨道号，避免越界读音量表 */
     v->gain         = (int32_t)INIT_G;
     v->sus_target   = SUS_ON ? ((uint32_t)v->peak * MUSIC_SUSTAIN_GAIN_Q8) >> 8u : INIT_G;
     v->attack_end   = g_sample_cnt + g_attack_ns;

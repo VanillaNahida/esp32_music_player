@@ -6,6 +6,10 @@
 每首曲子的宏名和数组名都相同，直接连续 #include 必然冲突，因此生成代码对每首曲子：
   1) 先用 #define g_score g_score_<i> 把音符数组改名；
   2) include 之后立刻 #undef 掉 4 个宏。
+另外 AudioLab 导出器把曲名里的中文映射成下划线来生成包含保护宏，不同曲名可能
+撞车（例如两个中文名都变成 __SCORE______H），第二个文件会被宏保护整个挡掉、
+导致生成的代码里宏未定义而编译报错。生成器检测到这种撞车时，会在 include 前
+补一句 #undef <guard>，保证每个 .h 都真正被展开一次、全部曲目都进固件。
 这样 src/music/ 下的全部乐谱都能编进同一个固件，增删曲目无需改动任何源码。
 
 由 platformio.ini 的 extra_scripts = pre:scripts/gen_score_playlist.py 在每次编译前调用。
@@ -99,6 +103,7 @@ def build_text(scores):
     add(" * 由 scripts/gen_score_playlist.py 编译前扫描 src/music/*.h 生成，")
     add(" * 收录 src/music/ 下的全部乐谱。新增曲目只需把 AudioLab 导出的 .h")
     add(" * 放进 src/music/ 再编译即可，不必修改任何源码。")
+    add(" * 曲名撞车导致包含保护宏相同时，会在 include 前补 #undef 保证照常收录。")
     add(" *")
     add(" * 编入的曲目数：%d" % len(scores))
     for i, s in enumerate(scores):
@@ -113,6 +118,9 @@ def build_text(scores):
     add("")
     for i, s in enumerate(scores):
         add("/* ---- [%d] %s : %s ---- */" % (i, s["file"], s["title"]))
+        if s.get("dup_guard"):
+            add("/* 与前面某个乐谱共用包含保护宏 %s：先 undef 才能再展开一次 */" % s["guard"])
+            add("#undef %s" % s["guard"])
         add("#define g_score g_score_%d" % i)
         add('#include "music/%s"' % s["file"])
         add("#undef g_score")
@@ -150,14 +158,14 @@ def main():
         s = read_score(path)
         if not s:
             continue
-        # 同一首曲子导出两次会共用包含保护宏，第二个 include 会被宏保护挡掉，
-        # 导致生成的代码里宏未定义而编译报错 —— 这里直接跳过并提示。
+        # 包含保护宏撞车：不能跳过（否则用户放进来的曲子会莫名其妙不播），
+        # 标记出来，生成代码里 include 前先 #undef 该宏再包含。
         g = s["guard"]
-        if g and g in guards:
-            print("[playlist] 跳过 %s（包含保护宏 %s 与 %s 相同，可能是同一首曲子的重复导出）"
-                  % (s["file"], g, guards[g]))
-            continue
-        if g:
+        s["dup_guard"] = bool(g) and (g in guards)
+        if s["dup_guard"]:
+            print("[playlist] 注意 %s 与 %s 的包含保护宏 %s 相同，已改为 #undef 后重复包含"
+                  % (s["file"], guards[g], g))
+        elif g:
             guards[g] = s["file"]
         scores.append(s)
     if not scores:
